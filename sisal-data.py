@@ -101,7 +101,7 @@ def ricostruisci_campionati(df):
 
 st.title("⚽ GG / NG Analytics")
 
-if st.sidebar.button("🔄 Ricarica dati"):
+if st.button("🔄 Ricarica dati"):
     st.cache_data.clear()
 
 with st.spinner("⏳ Caricamento dati..."):
