@@ -1,109 +1,249 @@
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
 import streamlit as st
+import plotly.express as px
+from datetime import datetime
 
-# ===========================
-# Funzioni
-# ===========================
+# =========================
+# CONFIG
+# =========================
 
-def ultime_date(n_giorni=14):
-    """Restituisce una lista di date a ritroso a partire da oggi, formato GG-MM-AAAA"""
-    oggi = datetime.now()
-    return [(oggi - timedelta(days=i)).strftime("%d-%m-%Y") for i in range(n_giorni)]
+BASE_URL = "https://betting.sisal.it/api/vrol-api/vrol/archivio/getArchivioGareCampionato/"
+CAMPIONATO_ID = 1
+PROVIDER_ID = 3
+TIPO_GARA = 6
+MODELLO_TARGET = "Goal/No Goal"
 
-@st.cache_data(ttl=3600)
-def carica_dati():
-    """
-    Scarica i dati dallo scraping Sisal per le ultime 14 giornate e restituisce un DataFrame.
-    """
-    base_url = "https://betting.sisal.it/api/vrol-api/vrol/archivio/getArchivioGareCampionato/1/3/6/"
-    giornate = ultime_date()
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json"
-    }
-    
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json"
+}
+
+st.set_page_config(
+    page_title="GG / NG Analytics",
+    layout="wide"
+)
+
+# =========================
+# DATA DOWNLOAD
+# =========================
+
+@st.cache_data
+def scarica_dati_oggi(_refresh):
+    oggi = datetime.now().strftime("%d-%m-%Y")
+    url = f"{BASE_URL}{CAMPIONATO_ID}/{PROVIDER_ID}/{TIPO_GARA}/{oggi}"
+    r = requests.get(url, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+# =========================
+# DATASET CREATION
+# =========================
+
+def crea_dataset(tutti_dati):
     rows = []
 
-    for giorno in giornate:
-        try:
-            r = requests.get(base_url + giorno, headers=headers, timeout=10)
-            data = r.json()
-        except Exception as e:
-            st.warning(f"Errore caricando {giorno}: {e}")
-            continue
+    for g in tutti_dati:
+        giornata = g.get("giornata")
+        timestamp = pd.to_datetime(g.get("dataPrimoEvento"))
 
-        for giornata_obj in data:
-            giornata_num = giornata_obj["giornata"]
-            data_evento = giornata_obj.get("dataPrimoEvento", "")[:10]
+        modelli = g.get("risultatoModelloScommessaCampionatoMap", {}).get(str(PROVIDER_ID), [])
 
-            risultati_map = giornata_obj.get("risultatoModelloScommessaCampionatoMap", {})
-            for modelli in risultati_map.values():
-                for modello in modelli:
-                    eventi = modello.get("eventiScommessaList", [])
-                    for evento in eventi:
-                        match = evento["descrizioneAvventimento"]
-                        home, away = match.split(" - ")
-                        orario = evento["dataOra"]
-                        risultati = evento.get("risultatoScommessaUfficialeList", [])
-                        for res in risultati:
-                            rows.append({
-                                "data": data_evento,
-                                "giornata": giornata_num,
-                                "orario": orario,
-                                "match": match,
-                                "home": home,
-                                "away": away,
-                                "descrizioneScommessa": res["descrizioneScommessa"],
-                                "esito": res["risultato"],
-                                "quota": float(res["quoteComb"]) / 100
-                            })
+        for m in modelli:
+            if m.get("modelloScommessa") != MODELLO_TARGET:
+                continue
 
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["data"] = pd.to_datetime(df["data"])
-        df["h2h_key"] = df.apply(lambda r: "-".join(sorted([r["home"], r["away"]])), axis=1)
+            for e in m.get("eventiScommessaList", []):
+                casa, trasferta = e.get("descrizioneAvventimento").split(" - ")
+
+                for r in e.get("risultatoScommessaUfficialeList", []):
+                    rows.append({
+                        "giornata": giornata,
+                        "timestamp": timestamp,
+                        "casa": casa.strip(),
+                        "trasferta": trasferta.strip(),
+                        "esito": r.get("risultato")
+                    })
+
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+# =========================
+# CAMPIONATI
+# =========================
+
+def ricostruisci_campionati(df):
+    df = df.copy()
+    df["campionato_id"] = None
+
+    df_rev = df[::-1].reset_index()
+
+    # attuale
+    viste = set()
+    for i, r in df_rev.iterrows():
+        viste.add(r["giornata"])
+        df.at[r["index"], "campionato_id"] = 0
+        if 1 in viste:
+            break
+
+    # passato
+    viste = set()
+    for j in range(i + 1, len(df_rev)):
+        viste.add(df_rev.at[j, "giornata"])
+        df.at[df_rev.at[j, "index"], "campionato_id"] = 1
+        if len(viste) == 22:
+            break
+
     return df
 
-# ===========================
-# Streamlit App
-# ===========================
+# =========================
+# UI HEADER
+# =========================
 
-st.set_page_config(page_title="Archivio Gare Sisal", layout="wide")
-st.title("Archivio Gare - Sisal Virtual Race")
+st.title("⚽ GG / NG Analytics")
 
-# --- Carico dati con cache ---
-df = carica_dati()
+# if st.sidebar.button("🔄 Ricarica dati"):
+#     st.cache_data.clear()
 
-if df.empty:
-    st.warning("Nessun dato disponibile al momento.")
-else:
-    # --- Filtri ---
-    squadre = sorted(list(set(df["home"].unique()) | set(df["away"].unique())))
-    squadra = st.selectbox("Seleziona squadra", squadre)
-    
-    tipo_scommessa = st.multiselect(
-        "Tipo di scommessa",
-        sorted(df["descrizioneScommessa"].unique()),
-        default=["Esito Finale 1X2"]
+with st.spinner("⏳ Caricamento dati..."):
+    df = ricostruisci_campionati(crea_dataset(scarica_dati_oggi("x")))
+
+# =========================
+# DATA SPLIT
+# =========================
+
+df_att = df[df.campionato_id == 0]
+df_pas = df[df.campionato_id == 1]
+
+# =========================
+# RIASSUNTO RAPIDO
+# =========================
+
+def summary(df):
+    tot = len(df)
+    gg = (df.esito == "Goal").sum()
+    return tot, gg, round(gg / tot * 100, 2)
+
+c1, c2 = st.columns(2)
+for col, titolo, d in [
+    (c1, "🟢 Campionato attuale", df_att),
+    (c2, "🔵 Campionato passato", df_pas)
+]:
+    tot, gg, rate = summary(d)
+    col.metric(titolo, f"{rate} % GG", f"{gg}/{tot}")
+
+# =========================
+# ANDAMENTO GIORNATE
+# =========================
+
+def andamento(df):
+    g = (
+        df.groupby("giornata")["esito"]
+        .value_counts()
+        .unstack(fill_value=0)
+        .reset_index()
     )
 
-    # --- Filtraggio ---
-    df_filtrato = df[
-        ((df["home"] == squadra) | (df["away"] == squadra)) &
-        (df["descrizioneScommessa"].isin(tipo_scommessa))
-    ].sort_values(["data", "orario"])
+    # FORZO LE COLONNE
+    if "Goal" not in g.columns:
+        g["Goal"] = 0
+    if "No Goal" not in g.columns:
+        g["No Goal"] = 0
 
-    st.write(f"Mostrando {len(df_filtrato)} eventi per {squadra}")
-    
-    # --- Visualizzazione ---
-    st.dataframe(df_filtrato[[
-        "data", "match", "home", "away", "descrizioneScommessa", "esito", "quota"
-    ]])
+    g["GG_rate"] = g["Goal"] / (g["Goal"] + g["No Goal"])
 
-    # --- Opzionale: Statistiche ---
-    if st.checkbox("Mostra statistiche base"):
-        stats = df_filtrato.groupby(["descrizioneScommessa", "esito"])["quota"].agg(["count", "mean"])
-        st.write(stats)
+    return g.sort_values("giornata")
+
+st.subheader("📈 Andamento giornate")
+
+fig1 = px.line(
+    andamento(df_att),
+    x="giornata",
+    y="GG_rate",
+    markers=True,
+    title="Campionato attuale – GG rate"
+)
+fig1.update_yaxes(range=[0, 1])
+st.plotly_chart(fig1, use_container_width=True)
+
+fig2 = px.line(
+    andamento(df_pas),
+    x="giornata",
+    y="GG_rate",
+    markers=True,
+    title="Campionato passato – GG rate (22 giornate)"
+)
+fig2.update_yaxes(range=[0, 1])
+st.plotly_chart(fig2, use_container_width=True)
+
+# =========================
+# GIORNATE ANOMALE
+# =========================
+
+st.subheader("🚨 Giornate anomale")
+
+soglia = st.slider("Soglia anomalia (%)", 10, 40, 20)
+
+att = andamento(df_att)
+media = att.GG_rate.mean()
+
+att["anomalia"] = att.GG_rate.apply(
+    lambda x: "⬆️ Alta" if x > media * (1 + soglia/100)
+    else "⬇️ Bassa" if x < media * (1 - soglia/100)
+    else ""
+)
+
+st.dataframe(
+    att[["giornata", "GG_rate", "anomalia"]],
+    use_container_width=True
+)
+
+# =========================
+# STATISTICHE SQUADRE
+# =========================
+
+st.subheader("👕 Statistiche per squadra")
+
+df_team = pd.concat([
+    df.assign(squadra=df.casa),
+    df.assign(squadra=df.trasferta)
+])
+
+camp_sel = st.selectbox(
+    "Campionato",
+    {"Attuale": 0, "Passato": 1}
+)
+
+teams = sorted(df_team[df_team.campionato_id == camp_sel].squadra.unique())
+team_sel = st.selectbox("Squadra", teams)
+
+team_df = df_team[
+    (df_team.squadra == team_sel) &
+    (df_team.campionato_id == camp_sel)
+]
+
+tot = len(team_df)
+gg = (team_df.esito == "Goal").sum()
+
+st.metric(
+    f"{team_sel}",
+    f"{round(gg/tot*100,2)} % GG",
+    f"{gg}/{tot} partite"
+)
+
+team_and = andamento(team_df)
+
+fig_team = px.bar(
+    team_and,
+    x="giornata",
+    y="GG_rate",
+    title=f"{team_sel} – GG rate per giornata"
+)
+fig_team.update_yaxes(range=[0, 1])
+st.plotly_chart(fig_team, use_container_width=True)
+
+# =========================
+# RAW DATA
+# =========================
+
+with st.expander("📄 Dataset completo"):
+    st.dataframe(df, use_container_width=True)
